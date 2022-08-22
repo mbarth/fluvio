@@ -5,16 +5,19 @@
 //! system parameters.
 //!
 use std::io::Error as IoError;
-use std::process;
 use std::io::ErrorKind;
+use std::path::PathBuf;
+use std::process;
 
+use clap::Parser;
+use fluvio_future::openssl::TlsAcceptor;
 use tracing::debug;
 use tracing::info;
-use clap::Parser;
 
 use fluvio_types::print_cli_err;
 use fluvio_types::SpuId;
-use fluvio_future::openssl::TlsAcceptor;
+
+use crate::services::auth::basic::BasicRbacPolicy;
 
 use super::SpuConfig;
 
@@ -61,21 +64,35 @@ pub struct SpuOpt {
 
     #[clap(flatten)]
     tls: TlsConfig,
+
+    #[clap(
+        long = "authorization-scopes",
+        value_name = "authorization scopes path",
+        env
+    )]
+    x509_auth_scopes: Option<PathBuf>,
+
+    #[clap(
+        long = "authorization-policy",
+        value_name = "authorization policy path",
+        env
+    )]
+    auth_policy: Option<PathBuf>,
 }
+
+type Config = (SpuConfig, Option<BasicRbacPolicy>);
 
 impl SpuOpt {
     /// Validate SPU (Streaming Processing Unit) cli inputs and generate SpuConfig
-    fn get_spu_config(self) -> Result<(SpuConfig, Option<(TlsAcceptor, String)>), IoError> {
+    fn get_spu_config(self) -> Result<(Config, Option<(TlsAcceptor, String)>), IoError> {
         let tls_acceptor = self.try_build_tls_acceptor()?;
-        let (spu_config, tls_addr_opt) = self.as_spu_config()?;
+        let (config, tls_addr_opt) = self.as_spu_config()?;
         let tls_config = tls_acceptor.map(|it| (it, tls_addr_opt.unwrap()));
-        Ok((spu_config, tls_config))
+        Ok((config, tls_config))
     }
 
     #[allow(clippy::wrong_self_convention)]
-    fn as_spu_config(self) -> Result<(SpuConfig, Option<String>), IoError> {
-        use std::path::PathBuf;
-
+    fn as_spu_config(self) -> Result<(Config, Option<String>), IoError> {
         let mut config = SpuConfig {
             id: match self.id {
                 Some(id) => id,
@@ -138,7 +155,17 @@ impl SpuOpt {
 
         config.peer_max_bytes = self.peer_max_bytes;
 
-        Ok((config, tls_port))
+        config.x509_auth_scopes = self.x509_auth_scopes;
+
+        // Set Configuration Authorzation Policy
+        let policy = match self.auth_policy {
+            // Lookup a policy from a path
+            Some(p) => Some(BasicRbacPolicy::try_from(p)?),
+            // Use root-only default policy if no policy path is found;
+            None => None,
+        };
+
+        Ok(((config, policy), tls_port))
     }
 
     fn try_build_tls_acceptor(&self) -> Result<Option<TlsAcceptor>, IoError> {
@@ -174,7 +201,7 @@ impl SpuOpt {
         Ok(Some(builder.build()))
     }
 
-    pub fn process_spu_cli_or_exit(self) -> (SpuConfig, Option<(TlsAcceptor, String)>) {
+    pub fn process_spu_cli_or_exit(self) -> (Config, Option<(TlsAcceptor, String)>) {
         match self.get_spu_config() {
             Err(err) => {
                 print_cli_err!(err);

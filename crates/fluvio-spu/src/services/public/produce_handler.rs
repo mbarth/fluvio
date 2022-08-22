@@ -2,8 +2,10 @@ use std::io::{Error, ErrorKind};
 
 use dataplane::batch::BatchRecords;
 use fluvio::{Compression};
+use fluvio_auth::{AuthContext, TypeAction};
+use fluvio_controlplane_metadata::extended::ObjectType;
 use fluvio_controlplane_metadata::topic::CompressionAlgorithm;
-use fluvio_storage::StorageError;
+use fluvio_storage::{StorageError, ReplicaStorage};
 use tracing::{debug, trace, error};
 use tracing::instrument;
 
@@ -20,7 +22,9 @@ use tokio::select;
 use std::time::Duration;
 use fluvio_future::timer::sleep;
 
-use crate::core::DefaultSharedGlobalContext;
+use crate::core::{DefaultSharedGlobalContext, GlobalContext};
+use crate::services::auth::AuthServiceContext;
+
 
 struct TopicWriteResult {
     topic: String,
@@ -36,29 +40,48 @@ struct PartitionWriteResult {
 }
 
 #[instrument(
-    skip(request,ctx),
+    skip(request,auth_context),
     fields(
         id = request.header.correlation_id(),
         client = %request.header.client_id()
     )
 )]
-pub async fn handle_produce_request(
+pub async fn handle_produce_request<AC: AuthContext, S: ReplicaStorage>(
     request: RequestMessage<DefaultProduceRequest>,
-    ctx: DefaultSharedGlobalContext,
+    auth_context: &AuthServiceContext<AC, S>,
 ) -> Result<ResponseMessage<ProduceResponse>, Error> {
+    if let Ok(authorized) = auth_context
+        .auth
+        .allow_type_action(ObjectType::Spu, TypeAction::Create)
+        .await
+    {
+        if !authorized {
+            trace!("authorization failed");
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "permission denied",
+            ));
+        }
+    } else {
+        return Err(Error::new(
+            ErrorKind::Interrupted,
+            "authorization io error",
+        ));
+    }
+
     let (header, produce_request) = request.get_header_request();
     trace!("Handling ProduceRequest: {:#?}", produce_request);
 
     let mut topic_results = Vec::with_capacity(produce_request.topics.len());
     for topic_request in produce_request.topics.into_iter() {
-        let topic_result = handle_produce_topic(&ctx, topic_request).await;
+        let topic_result = handle_produce_topic(&auth_context.global_ctx, topic_request).await;
         topic_results.push(topic_result);
     }
     wait_for_acks(
         produce_request.isolation,
         produce_request.timeout,
         &mut topic_results,
-        &ctx,
+        &auth_context.global_ctx,
     )
     .await;
     let response = into_response(topic_results);
@@ -70,8 +93,8 @@ pub async fn handle_produce_request(
     skip(ctx, topic_request),
     fields(topic = %topic_request.name),
 )]
-async fn handle_produce_topic(
-    ctx: &DefaultSharedGlobalContext,
+async fn handle_produce_topic<S: ReplicaStorage>(
+    ctx: &GlobalContext<S>,
     topic_request: DefaultTopicRequest,
 ) -> TopicWriteResult {
     trace!("Handling produce request for topic:");
@@ -95,8 +118,8 @@ async fn handle_produce_topic(
     skip(ctx, replica_id, partition_request),
     fields(%replica_id),
 )]
-async fn handle_produce_partition<R: BatchRecords>(
-    ctx: &DefaultSharedGlobalContext,
+async fn handle_produce_partition<S: ReplicaStorage, R: BatchRecords>(
+    ctx: &GlobalContext<S>,
     replica_id: ReplicaKey,
     partition_request: PartitionProduceData<RecordSet<R>>,
 ) -> PartitionWriteResult {

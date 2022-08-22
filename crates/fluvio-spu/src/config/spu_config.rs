@@ -95,6 +95,8 @@ pub struct SpuConfig {
     pub log: Log,
 
     pub peer_max_bytes: u32,
+
+    pub x509_auth_scopes: Option<PathBuf>,
 }
 
 impl Default for SpuConfig {
@@ -109,6 +111,7 @@ impl Default for SpuConfig {
             sc_retry_ms: SPU_RETRY_SC_TIMEOUT_MS,
             log: Log::default(),
             peer_max_bytes: fluvio_storage::FileReplica::PREFER_MAX_LEN,
+            x509_auth_scopes: None,
         }
     }
 }
